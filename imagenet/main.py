@@ -4,7 +4,6 @@ import random
 import shutil
 import time
 import warnings
-import sys
 
 import torch
 import torch.nn as nn
@@ -19,10 +18,6 @@ import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
 from torch.utils import mkldnn as mkldnn_utils
-
-import optimizer_util
-#import state_util
-import copy
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -86,6 +81,9 @@ parser.add_argument('--no-cuda', action='store_true', default=False,
 
 best_acc1 = 0
 
+MKLDNN_SUPPORT = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
+                  'resnet152', 'resnext50_32x4d', 'resnext101_32x8d',
+                  'wide_resnet50_2', 'wide_resnet101_2']
 
 def main():
     args = parser.parse_args()
@@ -159,7 +157,7 @@ def main_worker(gpu, ngpus_per_node, args):
             # DistributedDataParallel, we need to divide the batch size
             # ourselves based on the total number of GPUs we have
             args.batch_size = int(args.batch_size / ngpus_per_node)
-            args.workers = int(args.workers / ngpus_per_node)
+            args.workers = int((args.workers + ngpus_per_node - 1) / ngpus_per_node)
             model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         else:
             if args.cuda:
@@ -185,6 +183,7 @@ def main_worker(gpu, ngpus_per_node, args):
     # define loss function (criterion) and optimizer
     #criterion = nn.CrossEntropyLoss().cuda(args.gpu)
     criterion = nn.CrossEntropyLoss()
+
     if args.cuda:
         criterion.cuda(args.gpu)
 
@@ -194,7 +193,6 @@ def main_worker(gpu, ngpus_per_node, args):
 
     # optionally resume from a checkpoint
 
-    #mkldnn model can't be loaded 
     if args.resume:
         if os.path.isfile(args.resume):
             print("=> loading checkpoint '{}'".format(args.resume))
@@ -211,14 +209,12 @@ def main_worker(gpu, ngpus_per_node, args):
         else:
             print("=> no checkpoint found at '{}'".format(args.resume))
 
-    # support mkldnn
-    if (args.mkldnn and not args.cuda):
-        model = mkldnn_utils.to_mkldnn(model)
-        optimizer_util.to_mkldnn(optimizer)
+    if args.gpu is not None and args.cuda:
+        cudnn.benchmark = True
 
-        print("using mkldnn model\n")
-
-    cudnn.benchmark = True
+    if (args.mkldnn and not args.cuda and args.evaluate):
+        model = mkldnn_utils.to_mkldnn(model.eval())
+        print("using mkldnn model in evaluate\n")
 
     # Data loading code
     traindir = os.path.join(args.data, 'train')
@@ -275,25 +271,13 @@ def main_worker(gpu, ngpus_per_node, args):
 
         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                 and args.rank % ngpus_per_node == 0):
-            # save the model as cpu model
-            if (args.mkldnn and not args.cuda):
-                cpu_model = mkldnn_utils.to_dense(copy.deepcopy(model))
-                optimizer_util.to_dense(optimizer)
-                cpu_state_dict = cpu_model.state_dict()
-            else:
-                cpu_state_dict = model.state_dict()
-
             save_checkpoint({
                 'epoch': epoch + 1,
                 'arch': args.arch,
-                #'state_dict': model.state_dict(),
-                'state_dict': cpu_state_dict,
+                'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
-
-            if (args.mkldnn and not args.cuda):
-                optimizer_util.to_mkldnn(optimizer)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -302,27 +286,29 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(len(train_loader), batch_time, data_time, losses, top1,
-                             top5, prefix="Epoch: [{}]".format(epoch))
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
 
     # switch to train mode
     model.train()
 
     end = time.time()
-    for i, (input, target) in enumerate(train_loader):
+    for i, (images, target) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
         if (args.gpu is not None and args.cuda):
-            input = input.cuda(args.gpu, non_blocking=True)
+            images = images.cuda(args.gpu, non_blocking=True)
         if (args.mkldnn and not args.cuda):
-            input = input.to_mkldnn()
+            images = images.to_mkldnn()
 
         if args.cuda:
             target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        output = model(input)
+        output = model(images)
         if (args.mkldnn and not args.cuda):
             output = output.to_dense()
 
@@ -330,12 +316,13 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
-        if (args.mkldnn and args.gpu is None):
-            input = input.to_dense()
 
-        losses.update(loss.item(), input.size(0))
-        top1.update(acc1[0], input.size(0))
-        top5.update(acc5[0], input.size(0))
+        if (args.mkldnn and args.gpu is None):
+            images = images.to_dense()
+
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -347,7 +334,7 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
         end = time.time()
 
         if i % args.print_freq == 0:
-            progress.print(i)
+            progress.display(i)
 
 
 def validate(val_loader, model, criterion, args):
@@ -355,25 +342,25 @@ def validate(val_loader, model, criterion, args):
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     top5 = AverageMeter('Acc@5', ':6.2f')
-    progress = ProgressMeter(len(val_loader), batch_time, losses, top1, top5,
-                             prefix='Test: ')
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time, losses, top1, top5],
+        prefix='Test: ')
 
     # switch to evaluate mode
     model.eval()
 
     with torch.no_grad():
         end = time.time()
-        for i, (input, target) in enumerate(val_loader):
-            if (args.gpu is not None and args.cuda):
-                input = input.cuda(args.gpu, non_blocking=True)
-
-            if args.cuda:
+        for i, (images, target) in enumerate(val_loader):
+            if args.gpu is not None and args.cuda:
+                images = images.cuda(args.gpu, non_blocking=True)
                 target = target.cuda(args.gpu, non_blocking=True)
 
             if (args.mkldnn and not args.cuda):
-                input = input.to_mkldnn()
+                images = images.to_mkldnn()
             # compute output
-            output = model(input)
+            output = model(images)
             if (args.mkldnn and not args.cuda):
                 output = output.to_dense()
 
@@ -381,19 +368,20 @@ def validate(val_loader, model, criterion, args):
 
             # measure accuracy and record loss
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
-            if (args.mkldnn and not args.cuda):
-                input = input.to_dense()
 
-            losses.update(loss.item(), input.size(0))
-            top1.update(acc1[0], input.size(0))
-            top5.update(acc5[0], input.size(0))
+            if (args.mkldnn and not args.cuda):
+                images = images.to_dense()
+
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
 
             if i % args.print_freq == 0:
-                progress.print(i)
+                progress.display(i)
 
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
@@ -433,12 +421,12 @@ class AverageMeter(object):
 
 
 class ProgressMeter(object):
-    def __init__(self, num_batches, *meters, prefix=""):
+    def __init__(self, num_batches, meters, prefix=""):
         self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
         self.meters = meters
         self.prefix = prefix
 
-    def print(self, batch):
+    def display(self, batch):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
         print('\t'.join(entries))
